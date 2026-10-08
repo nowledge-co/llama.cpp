@@ -1895,7 +1895,11 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     const auto n_vocab    = vocab.n_tokens();
     const auto n_embd_out = hparams.n_embd_out();
 
-    bool has_logits = true;
+    // Pooled embeddings have no vocabulary-logit output to reserve or clear.
+    // Generation, per-token embeddings, and rank pooling retain their output contract.
+    bool has_logits = !(cparams.embeddings &&
+        cparams.pooling_type != LLAMA_POOLING_TYPE_NONE &&
+        cparams.pooling_type != LLAMA_POOLING_TYPE_RANK);
     bool has_embd   = cparams.embeddings;
 
     // TODO: hacky enc-dec support

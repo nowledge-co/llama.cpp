@@ -110,6 +110,13 @@ llm_build_qwen3::llm_build_qwen3(const llama_model & model, const llm_graph_para
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
 
+    // Pooled embeddings consume hidden states, not vocabulary logits.
+    // Preserve the existing graph for generation, per-token embeddings, and rank pooling.
+    if (cparams.embeddings && pooling_type != LLAMA_POOLING_TYPE_NONE && pooling_type != LLAMA_POOLING_TYPE_RANK) {
+        ggml_build_forward_expand(gf, cur);
+        return;
+    }
+
     // lm_head
     cur = build_lora_mm(model.output, cur);
 
