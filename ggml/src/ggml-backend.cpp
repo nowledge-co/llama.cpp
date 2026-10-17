@@ -48,12 +48,6 @@ void ggml_backend_memory_diagnostics_event(
     }
 }
 
-void ggml_backend_buffer_diagnostic_role(ggml_backend_buffer_t buffer, uint32_t role) {
-    buffer->diagnostic_role = role;
-    ggml_backend_memory_diagnostics_event(2, 1, (uintptr_t) buffer,
-        (uintptr_t) buffer->context, buffer->size, role, 0);
-}
-
 // backend buffer type
 
 const char * ggml_backend_buft_name(ggml_backend_buffer_type_t buft) {
@@ -756,6 +750,20 @@ ggml_backend_buffer_t ggml_backend_multi_buffer_alloc_buffer(ggml_backend_buffer
 bool ggml_backend_buffer_is_multi_buffer(ggml_backend_buffer_t buffer) {
     GGML_ASSERT(buffer);
     return buffer->iface.free_buffer == ggml_backend_multi_buffer_free_buffer;
+}
+
+void ggml_backend_buffer_diagnostic_role(ggml_backend_buffer_t buffer, uint32_t role) {
+    if (buffer->diagnostic_role != role) {
+        buffer->diagnostic_role = role;
+        ggml_backend_memory_diagnostics_event(2, 1, (uintptr_t) buffer,
+            (uintptr_t) buffer->context, buffer->size, role, 0);
+    }
+    if (ggml_backend_buffer_is_multi_buffer(buffer)) {
+        auto * ctx = (ggml_backend_multi_buffer_context *) buffer->context;
+        for (size_t i = 0; i < ctx->n_buffers; i++) {
+            ggml_backend_buffer_diagnostic_role(ctx->buffers[i], role);
+        }
+    }
 }
 
 void ggml_backend_multi_buffer_set_usage(ggml_backend_buffer_t buffer, enum ggml_backend_buffer_usage usage) {

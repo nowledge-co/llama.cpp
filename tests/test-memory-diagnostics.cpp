@@ -2,6 +2,7 @@
 #include "ggml-backend-impl.h"
 #ifdef GGML_USE_METAL
 #include "ggml-metal.h"
+#include "../ggml/src/ggml-metal/ggml-metal-device.h"
 #endif
 #include <cstdlib>
 #include <cstdio>
@@ -51,6 +52,9 @@ int main() {
     auto multi = ggml_backend_multi_buffer_alloc_buffer(children, 2);
     require(live.at({1, (uintptr_t) multi}).flags == 1);
     require(live.at({1, (uintptr_t) children[0]}).flags == 0);
+    ggml_backend_buffer_diagnostic_role(multi, 3);
+    require(live.at({1, (uintptr_t) children[0]}).role == 3);
+    require(live.at({1, (uintptr_t) children[1]}).role == 3);
     ggml_backend_buffer_free(multi);
     require(live.empty());
 #ifdef GGML_USE_METAL
@@ -60,11 +64,12 @@ int main() {
     auto gpu = ggml_backend_buft_alloc_buffer(ggml_backend_dev_buffer_type(dev), 65536);
     require(gpu != nullptr);
     unsigned metal = 0;
+    const uint32_t expected_storage = ggml_metal_buffer_is_shared((ggml_metal_buffer_t) gpu->context) ? 0 : 2;
     for (const auto & entry : live) {
         if (entry.first.first == 2) {
             require(entry.second.bytes >= 65536);
             require(entry.second.owner == live.at({1, (uintptr_t) gpu}).owner);
-            require((entry.second.flags & 255) == 0 || (entry.second.flags & 255) == 2);
+            require((entry.second.flags & 255) == expected_storage);
             ++metal;
         }
     }
