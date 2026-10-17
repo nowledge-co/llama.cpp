@@ -298,3 +298,12 @@ if (TARGET gguf-model-data)
     target_link_libraries(export-graph-ops PRIVATE gguf-model-data)
     target_compile_definitions(export-graph-ops PRIVATE LLAMA_HF_FETCH)
 endif()
+
+# Bounded allocation-only fixture: no model, server, data, or GPU compute.
+add_executable(test-memory-diagnostics test-memory-diagnostics.cpp)
+target_link_libraries(test-memory-diagnostics PRIVATE ggml)
+target_include_directories(test-memory-diagnostics PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
+if (GGML_METAL)
+    target_compile_definitions(test-memory-diagnostics PRIVATE GGML_USE_METAL)
+endif()
+llama_test(test-memory-diagnostics)

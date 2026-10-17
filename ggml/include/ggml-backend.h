@@ -30,6 +30,29 @@ extern "C" {
     typedef struct ggml_backend_device * ggml_backend_dev_t;
 
 
+    // Optional diagnostic observer. No payloads or tensor names are passed.
+    // A release event means the owning ggml reference is released, not that
+    // the driver has completed asynchronous work or returned physical pages.
+    // event: 1=create, 2=role update, 3=owner release
+    // domain: 1=ggml logical buffer, 2=Metal resource
+    // role: 0=unknown, 1=weights, 2=compute, 3=KV, 4=transfer
+    // flags are domain-specific: domain 1 bit 0=aggregate/meta logical view;
+    // domain 2 low 8 bits=Metal storageMode, bit 8=mapped (may overlap).
+    // Domains represent overlapping accounting views, never additive physical bytes.
+    // Unregister is not a quiescence barrier: callers that loaded the old callback
+    // can finish after it returns. Keep callback/state alive until all such calls
+    // finish (the Mem collector uses static state and checks its active flag).
+    // Only post-registration creations are observed; no inventory/replay occurs.
+    typedef void (*ggml_memory_diagnostic_callback)(
+        uint32_t event, uint32_t domain, uintptr_t id, uintptr_t owner,
+        uint64_t bytes, uint32_t role, uint32_t flags);
+    GGML_API bool ggml_backend_memory_diagnostics_enabled(void);
+    GGML_API void ggml_backend_memory_diagnostics_set_callback(ggml_memory_diagnostic_callback callback);
+    GGML_API void ggml_backend_memory_diagnostics_event(
+        uint32_t event, uint32_t domain, uintptr_t id, uintptr_t owner,
+        uint64_t bytes, uint32_t role, uint32_t flags);
+    GGML_API void ggml_backend_buffer_diagnostic_role(ggml_backend_buffer_t buffer, uint32_t role);
+
     //
     // Backend buffer type
     //

@@ -67,6 +67,7 @@ extern "C" {
         void * context;
         size_t size;
         enum ggml_backend_buffer_usage usage;
+        uint32_t diagnostic_role;
     };
 
     GGML_API ggml_backend_buffer_t ggml_backend_buffer_init(

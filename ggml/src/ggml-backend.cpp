@@ -20,6 +20,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <algorithm>
+#include <atomic>
 #include <vector>
 
 #ifdef __APPLE__
@@ -27,6 +28,31 @@
 #include <sys/sysctl.h>
 #endif
 
+
+static std::atomic<ggml_memory_diagnostic_callback> memory_diagnostic_callback { nullptr };
+
+bool ggml_backend_memory_diagnostics_enabled(void) {
+    return memory_diagnostic_callback.load(std::memory_order_acquire) != nullptr;
+}
+
+void ggml_backend_memory_diagnostics_set_callback(ggml_memory_diagnostic_callback callback) {
+    memory_diagnostic_callback.store(callback, std::memory_order_release);
+}
+
+void ggml_backend_memory_diagnostics_event(
+        uint32_t event, uint32_t domain, uintptr_t id, uintptr_t owner,
+        uint64_t bytes, uint32_t role, uint32_t flags) {
+    auto callback = memory_diagnostic_callback.load(std::memory_order_acquire);
+    if (callback != nullptr && id != 0) {
+        callback(event, domain, id, owner, bytes, role, flags);
+    }
+}
+
+void ggml_backend_buffer_diagnostic_role(ggml_backend_buffer_t buffer, uint32_t role) {
+    buffer->diagnostic_role = role;
+    ggml_backend_memory_diagnostics_event(2, 1, (uintptr_t) buffer,
+        (uintptr_t) buffer->context, buffer->size, role, 0);
+}
 
 // backend buffer type
 
@@ -94,9 +120,13 @@ ggml_backend_buffer_t ggml_backend_buffer_init(
         /* .buft      = */ buft,
         /* .context   = */ context,
         /* .size      = */ size,
-        /* .usage     = */ GGML_BACKEND_BUFFER_USAGE_ANY
+        /* .usage     = */ GGML_BACKEND_BUFFER_USAGE_ANY,
+        /* .diagnostic_role = */ 0
     };
 
+    ggml_backend_memory_diagnostics_event(1, 1, (uintptr_t) buffer,
+        (uintptr_t) context, size, 0,
+        ggml_backend_buffer_is_multi_buffer(buffer) || ggml_backend_buffer_is_meta(buffer) ? 1 : 0);
     return buffer;
 }
 
@@ -109,6 +139,8 @@ void ggml_backend_buffer_free(ggml_backend_buffer_t buffer) {
         return;
     }
 
+    ggml_backend_memory_diagnostics_event(3, 1, (uintptr_t) buffer,
+        (uintptr_t) buffer->context, buffer->size, buffer->diagnostic_role, 0);
     if (buffer->iface.free_buffer != NULL) {
         buffer->iface.free_buffer(buffer);
     }
@@ -178,6 +210,7 @@ bool ggml_backend_buffer_is_host(ggml_backend_buffer_t buffer) {
 void ggml_backend_buffer_set_usage(ggml_backend_buffer_t buffer, enum ggml_backend_buffer_usage usage) {
     GGML_ASSERT(buffer);
     buffer->usage = usage;
+    ggml_backend_buffer_diagnostic_role(buffer, (uint32_t) usage);
 
     // FIXME: add a generic callback to the buffer interface
     if (ggml_backend_buffer_is_multi_buffer(buffer)) {

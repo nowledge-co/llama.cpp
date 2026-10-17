@@ -1,6 +1,7 @@
 #import "ggml-metal-device.h"
 
 #import "ggml-impl.h"
+#import "ggml-backend.h"
 
 #include <Foundation/Foundation.h>
 
@@ -1366,6 +1367,12 @@ static bool ggml_metal_buffer_rset_init(ggml_metal_buffer_t buf) {
     return true;
 }
 
+// Couple the owner-release evidence to the actual reference release.
+static void ggml_metal_release_resource(id<MTLBuffer> metal, ggml_metal_buffer_t owner, uint32_t role) {
+    ggml_backend_memory_diagnostics_event(3, 2, (uintptr_t) metal, (uintptr_t) owner, 0, role, 0);
+    [metal release];
+}
+
 // rset free
 static void ggml_metal_buffer_rset_free(ggml_metal_buffer_t buf) {
 #if defined(GGML_METAL_HAS_RESIDENCY_SETS)
@@ -1466,6 +1473,13 @@ ggml_metal_buffer_t ggml_metal_buffer_init(ggml_metal_device_t dev, size_t size,
 
     ggml_metal_device_rsets_add(dev, res->rset);
 
+    for (int i = 0; ggml_backend_memory_diagnostics_enabled() && i < res->n_buffers; ++i) {
+        id<MTLBuffer> metal = res->buffers[i].metal;
+        ggml_backend_memory_diagnostics_event(1, 2, (uintptr_t) metal,
+            (uintptr_t) res, metal.allocatedSize, 0,
+            (uint32_t) metal.storageMode | (res->owned ? 0 : 256));
+    }
+
     //ggml_metal_log_allocated_size(device, size_aligned);
 
     return res;
@@ -1563,6 +1577,13 @@ ggml_metal_buffer_t ggml_metal_buffer_map(ggml_metal_device_t dev, void * ptr, s
 
     ggml_metal_device_rsets_add(dev, res->rset);
 
+    for (int i = 0; ggml_backend_memory_diagnostics_enabled() && i < res->n_buffers; ++i) {
+        id<MTLBuffer> metal = res->buffers[i].metal;
+        ggml_backend_memory_diagnostics_event(1, 2, (uintptr_t) metal,
+            (uintptr_t) res, metal.allocatedSize, 0,
+            (uint32_t) metal.storageMode | (res->owned ? 0 : 256));
+    }
+
     return res;
 }
 
@@ -1570,7 +1591,7 @@ void ggml_metal_buffer_free(ggml_metal_buffer_t buf) {
     ggml_metal_device_rsets_rm(buf->dev, buf->rset);
 
     for (int i = 0; i < buf->n_buffers; i++) {
-        [buf->buffers[i].metal release];
+        ggml_metal_release_resource(buf->buffers[i].metal, buf, 0);
     }
 
     ggml_metal_buffer_rset_free(buf);
@@ -1637,6 +1658,10 @@ void ggml_metal_buffer_set_tensor(ggml_metal_buffer_t buf, struct ggml_tensor * 
                                                           deallocator:nil];
 
         GGML_ASSERT(buf_src);
+        if (ggml_backend_memory_diagnostics_enabled()) {
+            ggml_backend_memory_diagnostics_event(1, 2, (uintptr_t) buf_src,
+                (uintptr_t) buf, buf_src.allocatedSize, 4, (uint32_t) buf_src.storageMode | 256);
+        }
 
         // dst
         struct ggml_metal_buffer_id bid_dst = ggml_metal_buffer_get_id(buf, tensor);
@@ -1671,6 +1696,7 @@ void ggml_metal_buffer_set_tensor(ggml_metal_buffer_t buf, struct ggml_tensor * 
 
         dispatch_semaphore_wait(completion_semaphore, DISPATCH_TIME_FOREVER);
         dispatch_release(completion_semaphore);
+        ggml_metal_release_resource(buf_src, buf, 4);
 
         //[cmd_buf waitUntilCompleted];
     }
@@ -1694,6 +1720,10 @@ void ggml_metal_buffer_get_tensor(ggml_metal_buffer_t buf, const struct ggml_ten
                                                           deallocator:nil];
 
         GGML_ASSERT(buf_dst);
+        if (ggml_backend_memory_diagnostics_enabled()) {
+            ggml_backend_memory_diagnostics_event(1, 2, (uintptr_t) buf_dst,
+                (uintptr_t) buf, buf_dst.allocatedSize, 4, (uint32_t) buf_dst.storageMode | 256);
+        }
 
         id<MTLCommandBuffer> cmd_buf = [buf->dev->mtl_queue commandBufferWithUnretainedReferences];
 
@@ -1711,6 +1741,7 @@ void ggml_metal_buffer_get_tensor(ggml_metal_buffer_t buf, const struct ggml_ten
 
         [cmd_buf commit];
         [cmd_buf waitUntilCompleted];
+        ggml_metal_release_resource(buf_dst, buf, 4);
     }
 }
 
