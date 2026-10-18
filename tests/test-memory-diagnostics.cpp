@@ -101,5 +101,9 @@ int main() {
 #endif
     ggml_backend_memory_diagnostics_set_callback(nullptr);
     require(!ggml_backend_memory_diagnostics_enabled());
+#if defined(GGML_USE_METAL)
     std::puts("native and Metal lifecycle: PASS");
+#else
+    std::puts("native lifecycle: PASS; Metal: NOT COMPILED");
+#endif
 }
