@@ -12552,6 +12552,18 @@ ErrorCode map_ssl_error(int ssl_error, int &out_errno) {
   }
 }
 
+// Keep ownership of a duplicate until the list accepts it.
+static bool append_client_ca_name(STACK_OF(X509_NAME) *list,
+                                 const X509_NAME *subject) {
+  auto name = X509_NAME_dup(subject);
+  if (!name) { return false; }
+  if (sk_X509_NAME_push(list, name) <= 0) {
+    X509_NAME_free(name);
+    return false;
+  }
+  return true;
+}
+
 // Helper: Create client CA list from PEM string
 // Returns a new STACK_OF(X509_NAME)* or nullptr on failure
 // Caller takes ownership of returned list
@@ -12571,9 +12583,24 @@ STACK_OF(X509_NAME) *
   X509 *cert = nullptr;
   while ((cert = PEM_read_bio_X509(bio, nullptr, nullptr, nullptr)) !=
          nullptr) {
-    X509_NAME *name = X509_get_subject_name(cert);
-    if (name) { sk_X509_NAME_push(ca_list, X509_NAME_dup(name)); }
+    const X509_NAME *name = X509_get_subject_name(cert);
+    if (name && !append_client_ca_name(ca_list, name)) {
+      X509_free(cert);
+      BIO_free(bio);
+      sk_X509_NAME_pop_free(ca_list, X509_NAME_free);
+      return nullptr;
+    }
     X509_free(cert);
+  }
+  // A null reader result is not necessarily the expected end of PEM input.
+  // Allocation and decode failures must not publish an empty/partial list.
+  const auto error = ERR_peek_last_error();
+  if (!BIO_eof(bio) ||
+      (error && (ERR_GET_LIB(error) != ERR_LIB_PEM ||
+                 ERR_GET_REASON(error) != PEM_R_NO_START_LINE))) {
+    BIO_free(bio);
+    sk_X509_NAME_pop_free(ca_list, X509_NAME_free);
+    return nullptr;
   }
   BIO_free(bio);
 
@@ -12592,8 +12619,7 @@ STACK_OF(X509_NAME) *
 
   auto objs = X509_STORE_get0_objects(store);
   if (!objs) {
-    sk_X509_NAME_free(ca_list);
-    return nullptr;
+    return ca_list;
   }
 
   auto count = sk_X509_OBJECT_num(objs);
@@ -12604,16 +12630,13 @@ STACK_OF(X509_NAME) *
       if (cert) {
         auto subject = X509_get_subject_name(cert);
         if (subject) {
-          auto name_dup = X509_NAME_dup(subject);
-          if (name_dup) { sk_X509_NAME_push(ca_list, name_dup); }
+          if (!append_client_ca_name(ca_list, subject)) {
+            sk_X509_NAME_pop_free(ca_list, X509_NAME_free);
+            return nullptr;
+          }
         }
       }
     }
-  }
-
-  if (sk_X509_NAME_num(ca_list) == 0) {
-    sk_X509_NAME_free(ca_list);
-    return nullptr;
   }
 
   return ca_list;
@@ -13312,7 +13335,8 @@ std::string error_string(uint64_t code) {
   return std::string(buf);
 }
 
-ca_store_t create_ca_store(const char *pem, size_t len) {
+static ca_store_t create_ca_store_impl(const char *pem, size_t len,
+                                     bool require_complete) {
   auto mem = BIO_new_mem_buf(pem, static_cast<int>(len));
   if (!mem) { return nullptr; }
   auto mem_guard = detail::scope_exit([&] { BIO_free_all(mem); });
@@ -13325,13 +13349,23 @@ ca_store_t create_ca_store(const char *pem, size_t len) {
     for (auto i = 0; i < static_cast<int>(sk_X509_INFO_num(inf)); i++) {
       auto itmp = sk_X509_INFO_value(inf, i);
       if (!itmp) { continue; }
-      if (itmp->x509) { X509_STORE_add_cert(store, itmp->x509); }
-      if (itmp->crl) { X509_STORE_add_crl(store, itmp->crl); }
+      if ((itmp->x509 && X509_STORE_add_cert(store, itmp->x509) != 1 &&
+           require_complete) ||
+          (itmp->crl && X509_STORE_add_crl(store, itmp->crl) != 1 &&
+           require_complete)) {
+        X509_STORE_free(store);
+        store = nullptr;
+        break;
+      }
     }
   }
 
   sk_X509_INFO_pop_free(inf, X509_INFO_free);
   return static_cast<ca_store_t>(store);
+}
+
+ca_store_t create_ca_store(const char *pem, size_t len) {
+  return create_ca_store_impl(pem, len, false);
 }
 
 void free_ca_store(ca_store_t store) {
@@ -13449,19 +13483,17 @@ bool update_server_client_ca(ctx_t ctx, const char *ca_pem) {
   auto ssl_ctx = static_cast<SSL_CTX *>(ctx);
 
   // Create new X509_STORE from PEM
-  auto store = create_ca_store(ca_pem, strlen(ca_pem));
+  auto store = create_ca_store_impl(ca_pem, strlen(ca_pem), true);
   if (!store) { return false; }
-
-  // SSL_CTX_set_cert_store takes ownership
-  SSL_CTX_set_cert_store(ssl_ctx, static_cast<X509_STORE *>(store));
-
-  // Set client CA list for client certificate request
   auto ca_list = impl::create_client_ca_list_from_pem(ca_pem);
-  if (ca_list) {
-    // SSL_CTX_set_client_CA_list takes ownership of ca_list
-    SSL_CTX_set_client_CA_list(ssl_ctx, ca_list);
+  if (!ca_list) {
+    free_ca_store(store);
+    return false;
   }
 
+  // Both objects are complete before either ownership transfer.
+  SSL_CTX_set_cert_store(ssl_ctx, static_cast<X509_STORE *>(store));
+  SSL_CTX_set_client_CA_list(ssl_ctx, ca_list);
   return true;
 }
 
@@ -13494,60 +13526,86 @@ std::string verify_error_string(long error_code) {
 namespace impl {
 
 // OpenSSL-specific helpers for public API wrappers
+static int server_context_error() {
+  auto error = ERR_get_error();
+  if (!error) {
+    // A failed native call must remain observable even without an error queue.
+    ERR_raise(ERR_LIB_SSL, ERR_R_INTERNAL_ERROR);
+    error = ERR_get_error();
+  }
+  return static_cast<int>(error);
+}
+
 ctx_t create_server_context_from_x509(X509 *cert, EVP_PKEY *key,
                                              X509_STORE *client_ca_store,
                                              int &out_error) {
+  // This consume-on-call argument is owned even when setup fails early.
+  auto store_guard = detail::scope_exit([&] {
+    X509_STORE_free(client_ca_store);
+  });
   out_error = 0;
   auto cert_pem = x509_to_pem(cert);
   auto key_pem = evp_pkey_to_pem(key);
   if (cert_pem.empty() || key_pem.empty()) {
-    out_error = static_cast<int>(ERR_get_error());
+    out_error = server_context_error();
     return nullptr;
   }
 
   auto ctx = create_server_context();
   if (!ctx) {
-    out_error = static_cast<int>(get_error());
+    out_error = server_context_error();
     return nullptr;
   }
 
   if (!set_server_cert_pem(ctx, cert_pem.c_str(), key_pem.c_str(), nullptr)) {
-    out_error = static_cast<int>(get_error());
+    out_error = server_context_error();
     free_context(ctx);
     return nullptr;
   }
 
   if (client_ca_store) {
-    // Set cert store for verification (SSL_CTX_set_cert_store takes ownership)
-    SSL_CTX_set_cert_store(static_cast<SSL_CTX *>(ctx), client_ca_store);
-
-    // Extract and set client CA list directly from store (more efficient than
-    // PEM conversion)
     auto ca_list = extract_client_ca_list_from_store(client_ca_store);
-    if (ca_list) {
-      SSL_CTX_set_client_CA_list(static_cast<SSL_CTX *>(ctx), ca_list);
+    if (!ca_list) {
+      out_error = server_context_error();
+      free_context(ctx);
+      return nullptr;
     }
-
+    SSL_CTX_set_cert_store(static_cast<SSL_CTX *>(ctx), client_ca_store);
+    client_ca_store = nullptr;
+    SSL_CTX_set_client_CA_list(static_cast<SSL_CTX *>(ctx), ca_list);
     set_verify_client(ctx, true);
   }
 
   return ctx;
 }
 
-void update_server_certs_from_x509(ctx_t ctx, X509 *cert, EVP_PKEY *key,
+bool update_server_certs_from_x509(ctx_t ctx, X509 *cert, EVP_PKEY *key,
                                           X509_STORE *client_ca_store) {
+  auto store_guard = detail::scope_exit([&] {
+    X509_STORE_free(client_ca_store);
+  });
   auto cert_pem = x509_to_pem(cert);
   auto key_pem = evp_pkey_to_pem(key);
-
-  if (!cert_pem.empty() && !key_pem.empty()) {
-    update_server_cert(ctx, cert_pem.c_str(), key_pem.c_str(), nullptr);
+  if (cert_pem.empty() || key_pem.empty()) { return false; }
+  auto ca_list = client_ca_store
+                     ? extract_client_ca_list_from_store(client_ca_store)
+                     : nullptr;
+  auto list_guard = detail::scope_exit([&] {
+    sk_X509_NAME_pop_free(ca_list, X509_NAME_free);
+  });
+  if (client_ca_store && !ca_list) { return false; }
+  if (!update_server_cert(ctx, cert_pem.c_str(), key_pem.c_str(), nullptr)) {
+    return false;
   }
-
   if (client_ca_store) {
-    auto ca_pem = x509_store_to_pem(client_ca_store);
-    if (!ca_pem.empty()) { update_server_client_ca(ctx, ca_pem.c_str()); }
-    X509_STORE_free(client_ca_store);
+    // Preserve the complete native store, including CRLs, without a lossy
+    // serialization round-trip through the generic client helper.
+    SSL_CTX_set_cert_store(static_cast<SSL_CTX *>(ctx), client_ca_store);
+    client_ca_store = nullptr;
+    SSL_CTX_set_client_CA_list(static_cast<SSL_CTX *>(ctx), ca_list);
+    ca_list = nullptr;
   }
+  return true;
 }
 
 ctx_t create_client_context_from_x509(X509 *cert, EVP_PKEY *key,
@@ -13619,8 +13677,11 @@ SSL_CTX *SSLServer::ssl_context() const {
 void SSLServer::update_certs(X509 *cert, EVP_PKEY *private_key,
                                     X509_STORE *client_ca_cert_store) {
   std::lock_guard<std::mutex> guard(ctx_mutex_);
-  tls::impl::update_server_certs_from_x509(ctx_, cert, private_key,
-                                           client_ca_cert_store);
+  last_ssl_error_ = 0;
+  if (!tls::impl::update_server_certs_from_x509(ctx_, cert, private_key,
+                                             client_ca_cert_store)) {
+    last_ssl_error_ = tls::impl::server_context_error();
+  }
 }
 
 SSLClient::SSLClient(const std::string &host, int port,
